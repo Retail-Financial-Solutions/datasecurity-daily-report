@@ -6,8 +6,9 @@ No local PC, no G:\ drive, no user login required.
 
 - Downloads CSV files from Google Drive DataSecurity folder via API
 - Consolidates into a single formatted Excel report
-- Uploads report to Google Drive Reports folder (Zapier watches this)
+- Uploads report to Consolidated_Report folder (Zapier watches this)
 - Saves a permanent archive copy to Reports_Archive folder
+- Both output folders are owned by service account, shared with your email
 - Zapier detects new file and sends email via Outlook
 
 Schedule: Daily at 7:30 AM via GitHub Actions cron
@@ -15,7 +16,6 @@ Schedule: Daily at 7:30 AM via GitHub Actions cron
 
 import os
 import re
-import io
 import json
 import logging
 import tempfile
@@ -35,11 +35,14 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 # ============================================================
 
 # Google Drive folder names
-GDRIVE_SOURCE_FOLDER_NAME   = "DataSecurity"         # folder with CSV files
-GDRIVE_REPORTS_FOLDER_NAME  = "Consolidated_Report"  # subfolder Zapier watches
-GDRIVE_ARCHIVE_FOLDER_NAME  = "Reports_Archive"      # permanent copy folder
+GDRIVE_SOURCE_FOLDER_NAME  = "DataSecurity"        # folder with CSV files (on your My Drive)
+GDRIVE_REPORTS_FOLDER_NAME = "Consolidated_Report" # Zapier watches this
+GDRIVE_ARCHIVE_FOLDER_NAME = "Reports_Archive"     # permanent copy folder
 
-# Google Drive API scope
+# Your Google account email — output folders will be shared with you
+USER_EMAIL = "jomcy@retailfinancialsolutions.ie"
+
+# Google Drive API scopes
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
@@ -91,7 +94,10 @@ def get_folder_id(service, folder_name, parent_id=None):
         query += f" and '{parent_id}' in parents"
 
     results = service.files().list(
-        q=query, fields="files(id, name)"
+        q=query,
+        fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
     ).execute()
 
     files = results.get("files", [])
@@ -103,28 +109,49 @@ def get_folder_id(service, folder_name, parent_id=None):
     return files[0]["id"]
 
 
-def create_folder_in_drive(service, folder_name, parent_id=None):
-    """Create a new folder in Google Drive and return its ID."""
+def create_folder_and_share(service, folder_name, share_with_email):
+    """
+    Create a new folder owned by the service account,
+    then share it with the user's email so they can see it in Drive.
+    """
+    # Create folder (owned by service account — no storage quota issue)
     file_metadata = {
         "name":     folder_name,
         "mimeType": "application/vnd.google-apps.folder",
     }
-    if parent_id:
-        file_metadata["parents"] = [parent_id]
-
     folder = service.files().create(
-        body=file_metadata, fields="id, name"
+        body=file_metadata,
+        fields="id, name",
+        supportsAllDrives=True
     ).execute()
-    logger.info(f"Created folder '{folder_name}' (ID: {folder['id']})")
-    return folder["id"]
+    folder_id = folder["id"]
+    logger.info(f"Created folder '{folder_name}' (ID: {folder_id})")
+
+    # Share with user email so it appears in their "Shared with me"
+    permission = {
+        "type":         "user",
+        "role":         "writer",
+        "emailAddress": share_with_email,
+    }
+    service.permissions().create(
+        fileId=folder_id,
+        body=permission,
+        sendNotificationEmail=False
+    ).execute()
+    logger.info(f"  Shared '{folder_name}' with {share_with_email}")
+
+    return folder_id
 
 
-def get_or_create_folder(service, folder_name, parent_id=None):
-    """Get folder ID, creating it if it doesn't exist."""
-    folder_id = get_folder_id(service, folder_name, parent_id)
+def get_or_create_output_folder(service, folder_name, share_with_email):
+    """
+    Get folder ID if it exists (owned by service account),
+    otherwise create it and share with user.
+    """
+    folder_id = get_folder_id(service, folder_name)
     if not folder_id:
-        logger.info(f"Creating missing folder: '{folder_name}'")
-        folder_id = create_folder_in_drive(service, folder_name, parent_id)
+        logger.info(f"Creating output folder: '{folder_name}'")
+        folder_id = create_folder_and_share(service, folder_name, share_with_email)
     return folder_id
 
 
@@ -136,7 +163,10 @@ def download_csvs_from_gdrive(service, folder_id, download_dir):
     """Download all CSV files from Google Drive folder to a temp directory."""
     query   = f"'{folder_id}' in parents and name contains '.csv' and trashed=false"
     results = service.files().list(
-        q=query, fields="files(id, name)"
+        q=query,
+        fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
     ).execute()
 
     csv_files = results.get("files", [])
@@ -341,14 +371,13 @@ def create_excel_report(df, output_path):
 
 
 # ============================================================
-# STEP 4a: UPLOAD REPORT TO CONSOLIDATED_REPORT (Zapier trigger)
+# STEP 4a: UPLOAD TO CONSOLIDATED_REPORT (Zapier trigger)
 # ============================================================
 
 def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
     """
-    Upload the Excel report to Consolidated_Report folder.
-    Deletes any existing file first so Zapier sees it as a brand new file.
-    Uses supportsAllDrives=True so service account can write to shared folders.
+    Upload the Excel report to Consolidated_Report folder (owned by service account).
+    Deletes existing file first so Zapier sees it as a brand new file.
     """
     file_name = os.path.basename(local_report_path)
 
@@ -366,9 +395,9 @@ def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
             fileId=f["id"],
             supportsAllDrives=True
         ).execute()
-        logger.info(f"  Deleted existing report from Consolidated_Report: {f['name']}")
+        logger.info(f"  Deleted existing: {f['name']}")
 
-    # Upload new report
+    # Upload new report into service account owned folder
     file_metadata = {
         "name":    file_name,
         "parents": [reports_folder_id]
@@ -400,15 +429,12 @@ def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
 
 def save_archive_copy(service, local_report_path, archive_folder_id):
     """
-    Save a permanent copy to Reports_Archive folder.
-    Uses a timestamped filename so every day's report is kept.
+    Save a permanent timestamped copy to Reports_Archive folder.
     Never deletes existing files — this is the permanent record.
     """
-    # Build timestamped archive filename
-    # e.g. DataSecurity_Report_2025-06-10_1245.xlsx
-    timestamp     = datetime.now().strftime("%Y-%m-%d_%H%M")
-    base_name     = os.path.splitext(os.path.basename(local_report_path))[0]
-    archive_name  = f"{base_name}_{timestamp}.xlsx"
+    timestamp    = datetime.now().strftime("%Y-%m-%d_%H%M")
+    base_name    = os.path.splitext(os.path.basename(local_report_path))[0]
+    archive_name = f"{base_name}_{timestamp}.xlsx"
 
     file_metadata = {
         "name":    archive_name,
@@ -450,26 +476,26 @@ def main():
     logger.info("-" * 40)
     service = get_drive_service()
 
-    # Get source folder ID
+    # Get source folder ID (DataSecurity — on your My Drive, shared with service account)
     source_folder_id = get_folder_id(service, GDRIVE_SOURCE_FOLDER_NAME)
     if not source_folder_id:
         logger.error("Cannot find DataSecurity folder. Exiting.")
         return
 
-    # Get Consolidated_Report folder (Zapier trigger) — must exist
-    reports_folder_id = get_folder_id(
-        service, GDRIVE_REPORTS_FOLDER_NAME, parent_id=None
-    )
-    if not reports_folder_id:
-        logger.error("Cannot find Consolidated_Report folder. Exiting.")
-        return
-
-    # Get or CREATE Reports_Archive folder (permanent copies)
-    archive_folder_id = get_or_create_folder(
-        service, GDRIVE_ARCHIVE_FOLDER_NAME, parent_id=None
+    # Get or create Consolidated_Report (owned by service account, shared with you)
+    logger.info("")
+    logger.info("Setting up output folders")
+    logger.info("-" * 40)
+    reports_folder_id = get_or_create_output_folder(
+        service, GDRIVE_REPORTS_FOLDER_NAME, USER_EMAIL
     )
 
-    # Use a temp directory — no C:\ paths needed in the cloud
+    # Get or create Reports_Archive (owned by service account, shared with you)
+    archive_folder_id = get_or_create_output_folder(
+        service, GDRIVE_ARCHIVE_FOLDER_NAME, USER_EMAIL
+    )
+
+    # Use a temp directory — no local paths needed in the cloud
     with tempfile.TemporaryDirectory() as tmp_dir:
 
         # Step 1: Download CSVs from Google Drive
@@ -500,7 +526,7 @@ def main():
         if "Report Date" in df.columns and df["Report Date"].notna().any():
             report_date = df["Report Date"].dropna().iloc[0]
 
-        # Step 3: Create Excel report in temp directory
+        # Step 3: Create Excel report
         logger.info("")
         logger.info("STEP 3: Creating Excel report")
         logger.info("-" * 40)
@@ -526,8 +552,8 @@ def main():
     logger.info("")
     logger.info("=" * 60)
     logger.info("COMPLETE")
-    logger.info(f"  Zapier will email the report shortly")
-    logger.info(f"  Archive copy saved to: DataSecurity/Reports_Archive/")
+    logger.info("  Zapier will email the report shortly")
+    logger.info("  Archive copy saved to: Reports_Archive/")
     logger.info("=" * 60)
 
 
