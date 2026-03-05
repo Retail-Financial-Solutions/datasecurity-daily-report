@@ -5,11 +5,12 @@ Runs entirely in the cloud via GitHub Actions.
 No local PC, no G:\ drive, no user login required.
 
 - Downloads CSV files from Google Drive DataSecurity folder via API
+  (uses service account for reading)
 - Consolidates into a single formatted Excel report
-- Uploads report to Consolidated_Report folder (Zapier watches this)
+- Uploads report to Consolidated_Report folder using OAuth
+  (uses your personal Google account for writing - no quota issues)
 - Saves a permanent archive copy to Reports_Archive folder
-- Both output folders are owned by service account, shared with your email
-- Zapier detects new file and sends email via Outlook
+- Zapier detects new file in Consolidated_Report and sends email
 
 Schedule: Daily at 7:30 AM via GitHub Actions cron
 """
@@ -26,6 +27,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
@@ -34,15 +37,10 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 # CONFIGURATION
 # ============================================================
 
-# Google Drive folder names
-GDRIVE_SOURCE_FOLDER_NAME  = "DataSecurity"        # folder with CSV files (on your My Drive)
+GDRIVE_SOURCE_FOLDER_NAME  = "DataSecurity"        # folder with CSV files
 GDRIVE_REPORTS_FOLDER_NAME = "Consolidated_Report" # Zapier watches this
 GDRIVE_ARCHIVE_FOLDER_NAME = "Reports_Archive"     # permanent copy folder
 
-# Your Google account email — output folders will be shared with you
-USER_EMAIL = "jomcy@retailfinancialsolutions.ie"
-
-# Google Drive API scopes
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
@@ -59,29 +57,63 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# GOOGLE DRIVE API CONNECTION
+# GOOGLE DRIVE API CONNECTIONS
+# Two connections:
+#   1. Service account — for READING CSV files from DataSecurity folder
+#   2. OAuth (your account) — for WRITING reports to output folders
 # ============================================================
 
-def get_drive_service():
-    """
-    Authenticate using service account credentials stored as a
-    GitHub Actions secret called GOOGLE_SERVICE_ACCOUNT_JSON.
-    """
+def get_service_account_service():
+    """Service account connection — used for downloading CSVs."""
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not creds_json:
-        raise ValueError(
-            "GOOGLE_SERVICE_ACCOUNT_JSON environment variable not set. "
-            "Add it as a GitHub Actions secret."
-        )
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON secret not set.")
 
     creds_dict  = json.loads(creds_json)
     credentials = service_account.Credentials.from_service_account_info(
         creds_dict, scopes=SCOPES
     )
     service = build("drive", "v3", credentials=credentials)
-    logger.info("Connected to Google Drive API")
+    logger.info("Connected to Google Drive API (service account)")
     return service
 
+
+def get_oauth_service():
+    """
+    OAuth connection using your personal Google account.
+    Used for uploading reports — no storage quota issues.
+    Credentials stored as GitHub secrets.
+    """
+    client_id     = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    refresh_token = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+
+    if not all([client_id, client_secret, refresh_token]):
+        raise ValueError(
+            "Missing OAuth secrets. Ensure GOOGLE_OAUTH_CLIENT_ID, "
+            "GOOGLE_OAUTH_CLIENT_SECRET and GOOGLE_OAUTH_REFRESH_TOKEN "
+            "are set as GitHub secrets."
+        )
+
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=SCOPES
+    )
+
+    # Refresh to get a valid access token
+    creds.refresh(Request())
+    service = build("drive", "v3", credentials=creds)
+    logger.info("Connected to Google Drive API (OAuth - your account)")
+    return service
+
+
+# ============================================================
+# FOLDER HELPERS
+# ============================================================
 
 def get_folder_id(service, folder_name, parent_id=None):
     """Find a Google Drive folder by name and return its ID."""
@@ -109,49 +141,22 @@ def get_folder_id(service, folder_name, parent_id=None):
     return files[0]["id"]
 
 
-def create_folder_and_share(service, folder_name, share_with_email):
-    """
-    Create a new folder owned by the service account,
-    then share it with the user's email so they can see it in Drive.
-    """
-    # Create folder (owned by service account — no storage quota issue)
-    file_metadata = {
-        "name":     folder_name,
-        "mimeType": "application/vnd.google-apps.folder",
-    }
-    folder = service.files().create(
-        body=file_metadata,
-        fields="id, name",
-        supportsAllDrives=True
-    ).execute()
-    folder_id = folder["id"]
-    logger.info(f"Created folder '{folder_name}' (ID: {folder_id})")
-
-    # Share with user email so it appears in their "Shared with me"
-    permission = {
-        "type":         "user",
-        "role":         "writer",
-        "emailAddress": share_with_email,
-    }
-    service.permissions().create(
-        fileId=folder_id,
-        body=permission,
-        sendNotificationEmail=False
-    ).execute()
-    logger.info(f"  Shared '{folder_name}' with {share_with_email}")
-
-    return folder_id
-
-
-def get_or_create_output_folder(service, folder_name, share_with_email):
-    """
-    Get folder ID if it exists (owned by service account),
-    otherwise create it and share with user.
-    """
-    folder_id = get_folder_id(service, folder_name)
+def get_or_create_folder(service, folder_name, parent_id=None):
+    """Get folder ID, creating it if it doesn't exist."""
+    folder_id = get_folder_id(service, folder_name, parent_id)
     if not folder_id:
-        logger.info(f"Creating output folder: '{folder_name}'")
-        folder_id = create_folder_and_share(service, folder_name, share_with_email)
+        logger.info(f"Creating folder: '{folder_name}'")
+        file_metadata = {
+            "name":     folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+        if parent_id:
+            file_metadata["parents"] = [parent_id]
+        folder   = service.files().create(
+            body=file_metadata, fields="id, name"
+        ).execute()
+        folder_id = folder["id"]
+        logger.info(f"Created folder '{folder_name}' (ID: {folder_id})")
     return folder_id
 
 
@@ -160,7 +165,7 @@ def get_or_create_output_folder(service, folder_name, share_with_email):
 # ============================================================
 
 def download_csvs_from_gdrive(service, folder_id, download_dir):
-    """Download all CSV files from Google Drive folder to a temp directory."""
+    """Download all CSV files from Google Drive DataSecurity folder."""
     query   = f"'{folder_id}' in parents and name contains '.csv' and trashed=false"
     results = service.files().list(
         q=query,
@@ -171,7 +176,7 @@ def download_csvs_from_gdrive(service, folder_id, download_dir):
 
     csv_files = results.get("files", [])
     if not csv_files:
-        logger.info("No CSV files found in Google Drive DataSecurity folder")
+        logger.info("No CSV files found in DataSecurity folder")
         return []
 
     logger.info(f"Found {len(csv_files)} CSV file(s) in Google Drive")
@@ -376,28 +381,23 @@ def create_excel_report(df, output_path):
 
 def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
     """
-    Upload the Excel report to Consolidated_Report folder (owned by service account).
-    Deletes existing file first so Zapier sees it as a brand new file.
+    Upload the Excel report to Consolidated_Report folder.
+    Uses OAuth (your personal account) so no storage quota issues.
+    Deletes existing file first so Zapier sees it as brand new.
     """
     file_name = os.path.basename(local_report_path)
 
-    # Delete existing file with same name so Zapier sees it as brand new
+    # Delete existing file with same name so Zapier triggers
     query    = (f"name='{file_name}' and '{reports_folder_id}' "
                 f"in parents and trashed=false")
     existing = service.files().list(
-        q=query,
-        fields="files(id, name)",
-        supportsAllDrives=True,
-        includeItemsFromAllDrives=True
+        q=query, fields="files(id, name)"
     ).execute()
     for f in existing.get("files", []):
-        service.files().delete(
-            fileId=f["id"],
-            supportsAllDrives=True
-        ).execute()
+        service.files().delete(fileId=f["id"]).execute()
         logger.info(f"  Deleted existing: {f['name']}")
 
-    # Upload new report into service account owned folder
+    # Upload new report
     file_metadata = {
         "name":    file_name,
         "parents": [reports_folder_id]
@@ -413,8 +413,7 @@ def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
     uploaded = service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id, name",
-        supportsAllDrives=True
+        fields="id, name"
     ).execute()
 
     logger.info(f"  Uploaded to Consolidated_Report: {uploaded['name']}")
@@ -429,8 +428,8 @@ def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
 
 def save_archive_copy(service, local_report_path, archive_folder_id):
     """
-    Save a permanent timestamped copy to Reports_Archive folder.
-    Never deletes existing files — this is the permanent record.
+    Save a permanent timestamped copy to Reports_Archive.
+    Never deletes existing files — permanent record.
     """
     timestamp    = datetime.now().strftime("%Y-%m-%d_%H%M")
     base_name    = os.path.splitext(os.path.basename(local_report_path))[0]
@@ -451,8 +450,7 @@ def save_archive_copy(service, local_report_path, archive_folder_id):
     uploaded = service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id, name",
-        supportsAllDrives=True
+        fields="id, name"
     ).execute()
 
     logger.info(f"  Archive copy saved: {uploaded['name']}")
@@ -470,40 +468,38 @@ def main():
     logger.info(f"Started: {datetime.now():%Y-%m-%d %H:%M:%S}")
     logger.info("=" * 60)
 
-    # Connect to Google Drive API
+    # Two separate Drive connections
     logger.info("")
     logger.info("Connecting to Google Drive API")
     logger.info("-" * 40)
-    service = get_drive_service()
+    read_service  = get_service_account_service()  # for downloading CSVs
+    write_service = get_oauth_service()             # for uploading reports
 
-    # Get source folder ID (DataSecurity — on your My Drive, shared with service account)
-    source_folder_id = get_folder_id(service, GDRIVE_SOURCE_FOLDER_NAME)
+    # Get source folder (DataSecurity) — via service account
+    source_folder_id = get_folder_id(read_service, GDRIVE_SOURCE_FOLDER_NAME)
     if not source_folder_id:
         logger.error("Cannot find DataSecurity folder. Exiting.")
         return
 
-    # Get or create Consolidated_Report (owned by service account, shared with you)
+    # Get or create output folders — via OAuth (your account)
     logger.info("")
     logger.info("Setting up output folders")
     logger.info("-" * 40)
-    reports_folder_id = get_or_create_output_folder(
-        service, GDRIVE_REPORTS_FOLDER_NAME, USER_EMAIL
+    reports_folder_id = get_or_create_folder(
+        write_service, GDRIVE_REPORTS_FOLDER_NAME
+    )
+    archive_folder_id = get_or_create_folder(
+        write_service, GDRIVE_ARCHIVE_FOLDER_NAME
     )
 
-    # Get or create Reports_Archive (owned by service account, shared with you)
-    archive_folder_id = get_or_create_output_folder(
-        service, GDRIVE_ARCHIVE_FOLDER_NAME, USER_EMAIL
-    )
-
-    # Use a temp directory — no local paths needed in the cloud
     with tempfile.TemporaryDirectory() as tmp_dir:
 
-        # Step 1: Download CSVs from Google Drive
+        # Step 1: Download CSVs
         logger.info("")
         logger.info("STEP 1: Downloading CSV files from Google Drive")
         logger.info("-" * 40)
         downloaded_files = download_csvs_from_gdrive(
-            service, source_folder_id, tmp_dir
+            read_service, source_folder_id, tmp_dir
         )
         if not downloaded_files:
             logger.info("No files to process. Exiting.")
@@ -541,13 +537,13 @@ def main():
         logger.info("")
         logger.info("STEP 4a: Uploading to Consolidated_Report (Zapier trigger)")
         logger.info("-" * 40)
-        upload_report_to_gdrive(service, local_path, reports_folder_id)
+        upload_report_to_gdrive(write_service, local_path, reports_folder_id)
 
         # Step 4b: Save permanent archive copy
         logger.info("")
         logger.info("STEP 4b: Saving archive copy to Reports_Archive")
         logger.info("-" * 40)
-        save_archive_copy(service, local_path, archive_folder_id)
+        save_archive_copy(write_service, local_path, archive_folder_id)
 
     logger.info("")
     logger.info("=" * 60)
