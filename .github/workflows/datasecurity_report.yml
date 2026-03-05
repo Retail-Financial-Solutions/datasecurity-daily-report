@@ -1,0 +1,27 @@
+name: DataSecurity Daily Report
+
+on:
+  schedule:
+    - cron: '30 7 * * 1-5'  # 7:30 AM UTC, Monday to Friday
+  workflow_dispatch:          # allows manual trigger from GitHub UI
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run DataSecurity report
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python datasecurity_report.py
