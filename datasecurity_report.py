@@ -449,16 +449,16 @@ def main():
 
     # Get Consolidated_Report folder (Zapier trigger) — must exist
     reports_folder_id = get_folder_id(
-    service, GDRIVE_REPORTS_FOLDER_NAME, parent_id=None
-)
+        service, GDRIVE_REPORTS_FOLDER_NAME, parent_id=None
+    )
     if not reports_folder_id:
         logger.error("Cannot find Consolidated_Report folder. Exiting.")
         return
 
     # Get or CREATE Reports_Archive folder (permanent copies)
-   archive_folder_id = get_or_create_folder(
-    service, GDRIVE_ARCHIVE_FOLDER_NAME, parent_id=None
-)
+    archive_folder_id = get_or_create_folder(
+        service, GDRIVE_ARCHIVE_FOLDER_NAME, parent_id=None
+    )
 
     # Use a temp directory — no C:\ paths needed in the cloud
     with tempfile.TemporaryDirectory() as tmp_dir:
