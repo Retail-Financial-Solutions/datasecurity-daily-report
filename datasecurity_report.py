@@ -35,7 +35,7 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
 # Google Drive folder names
 GDRIVE_SOURCE_FOLDER_NAME  = "DataSecurity"   # folder with CSV files
-GDRIVE_REPORTS_FOLDER_NAME = "Reports"        # subfolder Zapier watches
+GDRIVE_REPORTS_FOLDER_NAME = "Consolidated_Report"        # subfolder Zapier watches
 
 # Google Drive API scope
 SCOPES = ["https://www.googleapis.com/auth/drive"]
