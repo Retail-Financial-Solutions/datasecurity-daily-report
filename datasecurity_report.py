@@ -348,6 +348,7 @@ def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
     """
     Upload the Excel report to Consolidated_Report folder.
     Deletes any existing file first so Zapier sees it as a brand new file.
+    Uses supportsAllDrives=True so service account can write to shared folders.
     """
     file_name = os.path.basename(local_report_path)
 
@@ -355,10 +356,16 @@ def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
     query    = (f"name='{file_name}' and '{reports_folder_id}' "
                 f"in parents and trashed=false")
     existing = service.files().list(
-        q=query, fields="files(id, name)"
+        q=query,
+        fields="files(id, name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True
     ).execute()
     for f in existing.get("files", []):
-        service.files().delete(fileId=f["id"]).execute()
+        service.files().delete(
+            fileId=f["id"],
+            supportsAllDrives=True
+        ).execute()
         logger.info(f"  Deleted existing report from Consolidated_Report: {f['name']}")
 
     # Upload new report
@@ -377,7 +384,8 @@ def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
     uploaded = service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id, name"
+        fields="id, name",
+        supportsAllDrives=True
     ).execute()
 
     logger.info(f"  Uploaded to Consolidated_Report: {uploaded['name']}")
@@ -417,7 +425,8 @@ def save_archive_copy(service, local_report_path, archive_folder_id):
     uploaded = service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id, name"
+        fields="id, name",
+        supportsAllDrives=True
     ).execute()
 
     logger.info(f"  Archive copy saved: {uploaded['name']}")
