@@ -7,6 +7,7 @@ No local PC, no G:\ drive, no user login required.
 - Downloads CSV files from Google Drive DataSecurity folder via API
 - Consolidates into a single formatted Excel report
 - Uploads report to Google Drive Reports folder (Zapier watches this)
+- Saves a permanent archive copy to Reports_Archive folder
 - Zapier detects new file and sends email via Outlook
 
 Schedule: Daily at 7:30 AM via GitHub Actions cron
@@ -34,8 +35,9 @@ from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 # ============================================================
 
 # Google Drive folder names
-GDRIVE_SOURCE_FOLDER_NAME  = "DataSecurity"   # folder with CSV files
-GDRIVE_REPORTS_FOLDER_NAME = "Reports"        # subfolder Zapier watches
+GDRIVE_SOURCE_FOLDER_NAME   = "DataSecurity"         # folder with CSV files
+GDRIVE_REPORTS_FOLDER_NAME  = "Consolidated_Report"  # subfolder Zapier watches
+GDRIVE_ARCHIVE_FOLDER_NAME  = "Reports_Archive"      # permanent copy folder
 
 # Google Drive API scope
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -48,7 +50,7 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]  # GitHub Actions captures stdout
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
@@ -59,9 +61,8 @@ logger = logging.getLogger(__name__)
 
 def get_drive_service():
     """
-    Authenticate using service account credentials.
-    In GitHub Actions, credentials are stored as a secret called
-    GOOGLE_SERVICE_ACCOUNT_JSON and passed as an environment variable.
+    Authenticate using service account credentials stored as a
+    GitHub Actions secret called GOOGLE_SERVICE_ACCOUNT_JSON.
     """
     creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not creds_json:
@@ -95,11 +96,36 @@ def get_folder_id(service, folder_name, parent_id=None):
 
     files = results.get("files", [])
     if not files:
-        logger.error(f"Folder '{folder_name}' not found in Google Drive")
+        logger.warning(f"Folder '{folder_name}' not found in Google Drive")
         return None
 
     logger.info(f"Found folder '{folder_name}' (ID: {files[0]['id']})")
     return files[0]["id"]
+
+
+def create_folder_in_drive(service, folder_name, parent_id=None):
+    """Create a new folder in Google Drive and return its ID."""
+    file_metadata = {
+        "name":     folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    if parent_id:
+        file_metadata["parents"] = [parent_id]
+
+    folder = service.files().create(
+        body=file_metadata, fields="id, name"
+    ).execute()
+    logger.info(f"Created folder '{folder_name}' (ID: {folder['id']})")
+    return folder["id"]
+
+
+def get_or_create_folder(service, folder_name, parent_id=None):
+    """Get folder ID, creating it if it doesn't exist."""
+    folder_id = get_folder_id(service, folder_name, parent_id)
+    if not folder_id:
+        logger.info(f"Creating missing folder: '{folder_name}'")
+        folder_id = create_folder_in_drive(service, folder_name, parent_id)
+    return folder_id
 
 
 # ============================================================
@@ -315,11 +341,14 @@ def create_excel_report(df, output_path):
 
 
 # ============================================================
-# STEP 4: UPLOAD REPORT TO GOOGLE DRIVE REPORTS FOLDER
+# STEP 4a: UPLOAD REPORT TO CONSOLIDATED_REPORT (Zapier trigger)
 # ============================================================
 
 def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
-    """Upload the Excel report to Google Drive Reports folder for Zapier."""
+    """
+    Upload the Excel report to Consolidated_Report folder.
+    Deletes any existing file first so Zapier sees it as a brand new file.
+    """
     file_name = os.path.basename(local_report_path)
 
     # Delete existing file with same name so Zapier sees it as brand new
@@ -330,7 +359,7 @@ def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
     ).execute()
     for f in existing.get("files", []):
         service.files().delete(fileId=f["id"]).execute()
-        logger.info(f"  Deleted existing report from Drive: {f['name']}")
+        logger.info(f"  Deleted existing report from Consolidated_Report: {f['name']}")
 
     # Upload new report
     file_metadata = {
@@ -351,9 +380,48 @@ def upload_report_to_gdrive(service, local_report_path, reports_folder_id):
         fields="id, name"
     ).execute()
 
-    logger.info(f"Report uploaded to Google Drive: {uploaded['name']}")
-    logger.info(f"File ID: {uploaded['id']}")
-    logger.info("Zapier will now detect the new file and send the email.")
+    logger.info(f"  Uploaded to Consolidated_Report: {uploaded['name']}")
+    logger.info(f"  File ID: {uploaded['id']}")
+    logger.info("  Zapier will now detect the new file and send the email.")
+    return True
+
+
+# ============================================================
+# STEP 4b: SAVE ARCHIVE COPY TO Reports_Archive (permanent)
+# ============================================================
+
+def save_archive_copy(service, local_report_path, archive_folder_id):
+    """
+    Save a permanent copy to Reports_Archive folder.
+    Uses a timestamped filename so every day's report is kept.
+    Never deletes existing files — this is the permanent record.
+    """
+    # Build timestamped archive filename
+    # e.g. DataSecurity_Report_2025-06-10_1245.xlsx
+    timestamp     = datetime.now().strftime("%Y-%m-%d_%H%M")
+    base_name     = os.path.splitext(os.path.basename(local_report_path))[0]
+    archive_name  = f"{base_name}_{timestamp}.xlsx"
+
+    file_metadata = {
+        "name":    archive_name,
+        "parents": [archive_folder_id]
+    }
+    media = MediaFileUpload(
+        local_report_path,
+        mimetype=(
+            "application/vnd.openxmlformats-officedocument"
+            ".spreadsheetml.sheet"
+        )
+    )
+
+    uploaded = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id, name"
+    ).execute()
+
+    logger.info(f"  Archive copy saved: {uploaded['name']}")
+    logger.info(f"  Archive File ID: {uploaded['id']}")
     return True
 
 
@@ -373,18 +441,24 @@ def main():
     logger.info("-" * 40)
     service = get_drive_service()
 
-    # Get folder IDs
+    # Get source folder ID
     source_folder_id = get_folder_id(service, GDRIVE_SOURCE_FOLDER_NAME)
     if not source_folder_id:
         logger.error("Cannot find DataSecurity folder. Exiting.")
         return
 
+    # Get Consolidated_Report folder (Zapier trigger) — must exist
     reports_folder_id = get_folder_id(
         service, GDRIVE_REPORTS_FOLDER_NAME, parent_id=source_folder_id
     )
     if not reports_folder_id:
-        logger.error("Cannot find Reports folder. Exiting.")
+        logger.error("Cannot find Consolidated_Report folder. Exiting.")
         return
+
+    # Get or CREATE Reports_Archive folder (permanent copies)
+    archive_folder_id = get_or_create_folder(
+        service, GDRIVE_ARCHIVE_FOLDER_NAME, parent_id=source_folder_id
+    )
 
     # Use a temp directory — no C:\ paths needed in the cloud
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -428,15 +502,23 @@ def main():
         logger.info(f"  Stores with no activity: {len(empty_stores)}")
         logger.info(f"  Total records:           {record_count}")
 
-        # Step 4: Upload to Google Drive Reports folder for Zapier
+        # Step 4a: Upload to Consolidated_Report for Zapier
         logger.info("")
-        logger.info("STEP 4: Uploading report to Google Drive (for Zapier)")
+        logger.info("STEP 4a: Uploading to Consolidated_Report (Zapier trigger)")
         logger.info("-" * 40)
         upload_report_to_gdrive(service, local_path, reports_folder_id)
 
+        # Step 4b: Save permanent archive copy
+        logger.info("")
+        logger.info("STEP 4b: Saving archive copy to Reports_Archive")
+        logger.info("-" * 40)
+        save_archive_copy(service, local_path, archive_folder_id)
+
     logger.info("")
     logger.info("=" * 60)
-    logger.info("COMPLETE — Zapier will handle emailing the report")
+    logger.info("COMPLETE")
+    logger.info(f"  Zapier will email the report shortly")
+    logger.info(f"  Archive copy saved to: DataSecurity/Reports_Archive/")
     logger.info("=" * 60)
 
 
