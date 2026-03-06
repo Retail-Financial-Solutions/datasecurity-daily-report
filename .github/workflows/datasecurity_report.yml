@@ -1,8 +1,6 @@
 name: DataSecurity Daily Report
 
 on:
-  schedule:
-    - cron: '30 7  * * *'  # 12:45pm UTC, every day
   workflow_dispatch:          # allows manual trigger from GitHub UI
 
 jobs:
